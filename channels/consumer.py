@@ -2,7 +2,7 @@ import functools
 
 from asgiref.sync import async_to_sync
 
-from . import DEFAULT_CHANNEL_LAYER
+from . import DEFAULT_CHANNEL_LAYER, policies
 from .db import aclose_old_connections, database_sync_to_async
 from .exceptions import StopConsumer
 from .layers import get_channel_layer
@@ -40,8 +40,12 @@ class AsyncConsumer:
         """
         self.scope = scope
 
-        # Initialize channel layer
-        self.channel_layer = get_channel_layer(self.channel_layer_alias)
+        # Initialize channel layer. The consumer holds a policy-aware view
+        # for the duration of this session; the backend and its configuration
+        # are left untouched.
+        self.channel_layer = policies.gate_channel_layer(
+            get_channel_layer(self.channel_layer_alias)
+        )
         if self.channel_layer is not None:
             self.channel_name = await self.channel_layer.new_channel()
             self.channel_receive = functools.partial(
@@ -52,17 +56,47 @@ class AsyncConsumer:
             self.base_send = async_to_sync(send)
         else:
             self.base_send = send
+        # Every consumer session gets a fresh, isolated runtime policy stack
+        # and policy-owned session state. The reset tokens restore any
+        # enclosing scope on exit.
+        if self._sync:
+            session_token = policies.bind_session(sync_close=self._policy_force_close)
+        else:
+            session_token = policies.bind_session(async_close=self._policy_force_close)
+        stack_token = policies.reset_stack()
         # Pass messages in from channel layer or client to dispatch method
         try:
             if self.channel_layer is not None:
                 await await_many_dispatch(
-                    [receive, self.channel_receive], self.dispatch
+                    [receive, self.channel_receive], self._policy_dispatch
                 )
             else:
-                await await_many_dispatch([receive], self.dispatch)
+                await await_many_dispatch([receive], self._policy_dispatch)
         except StopConsumer:
             # Exit cleanly
             pass
+        finally:
+            policies.restore_stack(stack_token)
+            policies.end_session(session_token)
+
+    async def _policy_dispatch(self, message):
+        """
+        Session-policy admission boundary for inbound messages. Every
+        inbound message (from the client receive callable or from the channel
+        layer) passes through here before reaching ``dispatch`` and therefore
+        any consumer handler, including WebsocketConsumer.receive /
+        receive_json. A rejected message is dropped observably (see the frame
+        event log) without tearing down the consumer.
+        """
+        if policies.admit_inbound(message):
+            await self.dispatch(message)
+
+    async def _policy_force_close(self, code=1000):
+        """
+        Emit a raw lifecycle close when a force_close frame pops. This never
+        goes through the outbound data gate.
+        """
+        await self.base_send({"type": "websocket.close", "code": code})
 
     async def dispatch(self, message):
         """
@@ -78,8 +112,21 @@ class AsyncConsumer:
     async def send(self, message):
         """
         Overrideable/callable-by-subclasses send method.
+
+        Outbound ASGI messages consult the session outbound gate, while the
+        websocket accept/close lifecycle messages consult the lifecycle gate.
         """
-        await self.base_send(message)
+        message_type = message.get("type")
+        if message_type == "websocket.accept":
+            policies.guard_accept()
+            await self.base_send(message)
+            policies.note_accepted()
+        elif message_type == "websocket.close":
+            policies.note_close_requested()
+            await self.base_send(message)
+        else:
+            policies.guard_outbound({"via": "asgi.send", "type": message_type})
+            await self.base_send(message)
 
     @classmethod
     def as_asgi(cls, **initkwargs):
@@ -127,8 +174,24 @@ class SyncConsumer(AsyncConsumer):
         else:
             raise ValueError("No handler for message type %s" % message["type"])
 
+    def _policy_force_close(self, code=1000):
+        self.base_send({"type": "websocket.close", "code": code})
+
     def send(self, message):
         """
         Overrideable/callable-by-subclasses send method.
+
+        Mirrors the async version; context variables propagate across the
+        asgiref sync/async bridge, so the live session stack is read here.
         """
-        self.base_send(message)
+        message_type = message.get("type")
+        if message_type == "websocket.accept":
+            policies.guard_accept()
+            self.base_send(message)
+            policies.note_accepted()
+        elif message_type == "websocket.close":
+            policies.note_close_requested()
+            self.base_send(message)
+        else:
+            policies.guard_outbound({"via": "asgi.send", "type": message_type})
+            self.base_send(message)

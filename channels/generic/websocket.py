@@ -2,6 +2,7 @@ import json
 
 from asgiref.sync import async_to_sync
 
+from .. import policies
 from ..consumer import AsyncConsumer, SyncConsumer
 from ..db import aclose_old_connections
 from ..exceptions import (
@@ -100,6 +101,9 @@ class WebsocketConsumer(SyncConsumer):
         Called when a WebSocket connection is closed. Base level so you don't
         need to call super() all the time.
         """
+        # The peer is gone; any force_close frame popping later must not try
+        # to close this session again.
+        policies.note_session_ended()
         try:
             for group in self.groups:
                 async_to_sync(self.channel_layer.group_discard)(
@@ -240,6 +244,9 @@ class AsyncWebsocketConsumer(AsyncConsumer):
         Called when a WebSocket connection is closed. Base level so you don't
         need to call super() all the time.
         """
+        # The peer is gone; any force_close frame popping later must not try
+        # to close this session again.
+        policies.note_session_ended()
         try:
             for group in self.groups:
                 await self.channel_layer.group_discard(group, self.channel_name)
